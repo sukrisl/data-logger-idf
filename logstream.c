@@ -208,6 +208,22 @@ static esp_err_t save_metadata(logstream_t* stream) {
     return storage_write_sync(worker, stream->metapath, buffer, sizeof(buffer), &stream->sync_write);
 }
 
+static esp_err_t commit_metadata(logstream_t* stream, const logstream_meta_t new_meta) {
+    if (!stream) return ESP_ERR_INVALID_ARG;
+
+    logstream_meta_t old_meta = stream->meta;
+    stream->meta = new_meta;
+
+    esp_err_t err = save_metadata(stream);
+
+    // Restore old metadata on failure
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to commit metadata changes, reverting");
+        stream->meta = old_meta;
+    }
+    return err;
+}
+
 static esp_err_t check_buffer_capacity(logstream_t* stream, size_t entry_size) {
     if (!stream) return ESP_ERR_INVALID_ARG;
 
@@ -276,10 +292,8 @@ esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t*
     // Load metadata
     err = load_metadata(out_stream);
     if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_INVALID_CRC) {
-        // Fresh or invalid metadata: wipe old files to avoid format mismatches
-        reset_stream_files(out_stream);
-        // Persist the reset metadata
-        err = save_metadata(out_stream);
+        reset_stream_files(out_stream);   // Fresh or invalid metadata: wipe old files to avoid format mismatches
+        err = save_metadata(out_stream);  // Persist the reset metadata
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to save new metadata for stream '%s'", stream_name);
             return err;
@@ -351,19 +365,21 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     header->length = (uint16_t)(len + 1);  // include terminator
     header->checksum = calculate_entry_checksum(entry_buffer + ENTRY_HEADER_SIZE, header->length);
 
+    logstream_meta_t meta_temp = stream->meta;
+
     // Check if entry fits in current file
-    if (stream->meta.head.offset + total_entry_size > MAX_FILE_SIZE) {
+    if (meta_temp.head.offset + total_entry_size > MAX_FILE_SIZE) {
         // Move to next file
-        stream->meta.head.file_index = (stream->meta.head.file_index + 1) % MAX_FILES_PER_STREAM;
-        stream->meta.head.offset = 0;
+        meta_temp.head.file_index = (meta_temp.head.file_index + 1) % MAX_FILES_PER_STREAM;
+        meta_temp.head.offset = 0;
     }
 
     // Write entry to current file
     char file_path[STORAGE_MAX_PATH];
-    get_file_path(stream, stream->meta.head.file_index, file_path, sizeof(file_path));
+    get_file_path(stream, meta_temp.head.file_index, file_path, sizeof(file_path));
 
     // Write new file if offset is zero, else append
-    if (stream->meta.head.offset == 0) {
+    if (meta_temp.head.offset == 0) {
         err = storage_write_sync(&stream->logger->storage_handle, file_path, entry_buffer, total_entry_size,
                                  &stream->sync_write);
     } else {
@@ -378,17 +394,14 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     }
 
     // Update metadata
-    stream->meta.head.offset += total_entry_size;
-    stream->meta.num_unread_entries++;
+    meta_temp.head.offset += total_entry_size;
+    meta_temp.num_unread_entries++;
 
     // Save metadata
-    err = save_metadata(stream);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to save metadata");
-    }
+    err = commit_metadata(stream, meta_temp);
 
     xSemaphoreGive(stream->meta_mutex);
-    return ESP_OK;
+    return err;
 }
 
 esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_size, size_t* bytes_read) {
@@ -399,6 +412,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
     *bytes_read = 0;
     xSemaphoreTake(stream->meta_mutex, portMAX_DELAY);
 
+    // No unread entries
     if (stream->meta.num_unread_entries == 0) {
         xSemaphoreGive(stream->meta_mutex);
         return ESP_ERR_NOT_FOUND;
@@ -494,27 +508,29 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
 
         // Check if we've reached the head pointer (stop after advancing, not before)
         if (current_pos.file_index == stream->meta.head.file_index && current_pos.offset >= stream->meta.head.offset) {
-            // Reached the head, stop reading
-            break;
+            break;  // Reached the head, stop reading
         }
     }
 
     *bytes_read = out_offset;
 
     // Update metadata if we read any entries
+    logstream_meta_t meta_temp = stream->meta;
+    esp_err_t err = ESP_OK;
     if (entries_read > 0) {
-        stream->meta.tail = current_pos;
-        stream->meta.num_unread_entries -= entries_read;
+        meta_temp.tail = current_pos;
+        meta_temp.num_unread_entries -= entries_read;
 
         // Invariant: empty stream implies tail == head.
-        if (stream->meta.num_unread_entries == 0) {
-            stream->meta.tail = stream->meta.head;
+        if (meta_temp.num_unread_entries == 0) {
+            meta_temp.tail = meta_temp.head;
         }
 
         // Save metadata
-        esp_err_t err = save_metadata(stream);
+        esp_err_t err = commit_metadata(stream, meta_temp);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to save metadata");
+            xSemaphoreGive(stream->meta_mutex);
+            return err;
         }
     }
 
