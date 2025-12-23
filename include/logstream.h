@@ -25,7 +25,8 @@ typedef struct {
 
 typedef struct {
     char name[16];
-    char dirpath[STORAGE_MAX_PATH];
+    char dirpath[STORAGE_MAX_PATH - 32];
+    char metapath[STORAGE_MAX_PATH];
     logger_t* logger;
     logstream_meta_t meta;
     // Synchronization primitives

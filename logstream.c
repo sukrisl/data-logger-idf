@@ -53,10 +53,6 @@ static void get_file_path(const logstream_t* stream, uint16_t file_index, char* 
     snprintf(out_path, max_len, "%s/%u.log", stream->dirpath, file_index);
 }
 
-static void get_meta_path(const logstream_t* stream, char* out_path, size_t max_len) {
-    snprintf(out_path, max_len, "%s/meta", stream->dirpath);
-}
-
 // Synchronous wrappers around storage_worker operations
 static inline esp_err_t wait_for_sync(op_sync_t* sync, uint32_t timeout_ms) {
     if (!sync || !sync->sem) return ESP_ERR_INVALID_ARG;
@@ -152,10 +148,7 @@ static esp_err_t load_metadata(logstream_t* stream) {
     logstream_meta_t* meta = &stream->meta;
     if (!meta) return ESP_ERR_INVALID_ARG;
 
-    char meta_path[STORAGE_MAX_PATH];
-    get_meta_path(stream, meta_path, sizeof(meta_path));
-
-    esp_err_t err = storage_read_sync(worker, meta_path, buffer, sizeof(buffer), &stream->sync_read);
+    esp_err_t err = storage_read_sync(worker, stream->metapath, buffer, sizeof(buffer), &stream->sync_read);
     if (err != ESP_OK) {
         // Initialize new metadata if file doesn't exist
         meta->version = METADATA_VERSION;
@@ -203,12 +196,16 @@ static void reset_stream_files(logstream_t* stream) {
     }
 }
 
-static esp_err_t save_metadata(storage_worker_t* worker, const char* meta_path, logstream_meta_t* meta,
-                               op_sync_t* sync_write) {
+static esp_err_t save_metadata(logstream_t* stream) {
+    if (!stream || !stream->logger) return ESP_ERR_INVALID_ARG;
+
+    logstream_meta_t* meta = &stream->meta;
+    storage_worker_t* worker = &stream->logger->storage_handle;
+
     meta->crc8 = calculate_meta_crc(meta);
     uint8_t buffer[sizeof(logstream_meta_t)];
     memcpy(buffer, meta, sizeof(logstream_meta_t));
-    return storage_write_sync(worker, meta_path, buffer, sizeof(buffer), sync_write);
+    return storage_write_sync(worker, stream->metapath, buffer, sizeof(buffer), &stream->sync_write);
 }
 
 static esp_err_t check_buffer_capacity(logstream_t* stream, size_t entry_size) {
@@ -244,9 +241,9 @@ esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t*
 
     // Prepare logstream structure
     snprintf(out_stream->name, sizeof(out_stream->name), "%s", stream_name);
-
     snprintf(out_stream->dirpath, sizeof(out_stream->dirpath), "%s/%s", logger->storage_handle.mount.base_path,
              stream_name);
+    snprintf(out_stream->metapath, sizeof(out_stream->metapath), "%s/meta", (const char*)out_stream->dirpath);
     out_stream->logger = logger;
 
     // Create a single semaphore used for all sync contexts
@@ -277,14 +274,12 @@ esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t*
     }
 
     // Load metadata
-    char meta_path[STORAGE_MAX_PATH];
-    get_meta_path(out_stream, meta_path, sizeof(meta_path));
     err = load_metadata(out_stream);
     if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_INVALID_CRC) {
         // Fresh or invalid metadata: wipe old files to avoid format mismatches
         reset_stream_files(out_stream);
         // Persist the reset metadata
-        err = save_metadata(&logger->storage_handle, meta_path, &out_stream->meta, &out_stream->sync_write);
+        err = save_metadata(out_stream);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to save new metadata for stream '%s'", stream_name);
             return err;
@@ -303,9 +298,7 @@ esp_err_t logstream_close(logstream_t* stream) {
     if (!stream || !stream->logger) return ESP_ERR_INVALID_ARG;
 
     // Save metadata before closing
-    char meta_path[STORAGE_MAX_PATH];
-    get_meta_path(stream, meta_path, sizeof(meta_path));
-    esp_err_t err = save_metadata(&stream->logger->storage_handle, meta_path, &stream->meta, &stream->sync_write);
+    esp_err_t err = save_metadata(stream);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to save metadata for stream '%s', error=%s", stream->name, esp_err_to_name(err));
         return err;
@@ -369,12 +362,11 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     char file_path[STORAGE_MAX_PATH];
     get_file_path(stream, stream->meta.head.file_index, file_path, sizeof(file_path));
 
+    // Write new file if offset is zero, else append
     if (stream->meta.head.offset == 0) {
-        // Write new file
         err = storage_write_sync(&stream->logger->storage_handle, file_path, entry_buffer, total_entry_size,
                                  &stream->sync_write);
     } else {
-        // Append to existing file
         err = storage_append_sync(&stream->logger->storage_handle, file_path, entry_buffer, total_entry_size,
                                   &stream->sync_append);
     }
@@ -390,9 +382,7 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     stream->meta.num_unread_entries++;
 
     // Save metadata
-    char meta_path[STORAGE_MAX_PATH];
-    get_meta_path(stream, meta_path, sizeof(meta_path));
-    err = save_metadata(&stream->logger->storage_handle, meta_path, &stream->meta, &stream->sync_write);
+    err = save_metadata(stream);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to save metadata");
     }
@@ -522,9 +512,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         }
 
         // Save metadata
-        char meta_path[STORAGE_MAX_PATH];
-        get_meta_path(stream, meta_path, sizeof(meta_path));
-        esp_err_t err = save_metadata(&stream->logger->storage_handle, meta_path, &stream->meta, &stream->sync_write);
+        esp_err_t err = save_metadata(stream);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Failed to save metadata");
         }
