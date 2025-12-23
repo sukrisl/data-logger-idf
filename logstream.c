@@ -345,7 +345,10 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     size_t total_entry_size = ENTRY_HEADER_SIZE + (len + 1);
 
     // Protect metadata access from concurrent producers
-    xSemaphoreTake(stream->meta_mutex, portMAX_DELAY);
+    if (xSemaphoreTake(stream->meta_mutex, pdMS_TO_TICKS(LOGGER_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Another operation is in progress on stream '%s'", stream->name);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     // Check if buffer is full.
     // Full means: writing this entry would overwrite unread data (tail) in the circular address space.
@@ -410,7 +413,10 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
     }
 
     *bytes_read = 0;
-    xSemaphoreTake(stream->meta_mutex, portMAX_DELAY);
+    if (xSemaphoreTake(stream->meta_mutex, pdMS_TO_TICKS(LOGGER_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Another operation is in progress on stream '%s'", stream->name);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     // No unread entries
     if (stream->meta.num_unread_entries == 0) {
@@ -516,7 +522,6 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
 
     // Update metadata if we read any entries
     logstream_meta_t meta_temp = stream->meta;
-    esp_err_t err = ESP_OK;
     if (entries_read > 0) {
         meta_temp.tail = current_pos;
         meta_temp.num_unread_entries -= entries_read;
