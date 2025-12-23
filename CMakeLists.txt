@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS 
         "logger.c"
+        "logstream.c"
     INCLUDE_DIRS 
         "include"
     REQUIRES 
