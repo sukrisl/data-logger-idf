@@ -211,6 +211,29 @@ static esp_err_t save_metadata(storage_worker_t* worker, const char* meta_path, 
     return storage_write_sync(worker, meta_path, buffer, sizeof(buffer), sync_write);
 }
 
+static esp_err_t check_buffer_capacity(logstream_t* stream, size_t entry_size) {
+    if (!stream) return ESP_ERR_INVALID_ARG;
+
+    // If there are no unread entries, there is always space.
+    if (stream->meta.num_unread_entries == 0) return ESP_OK;
+
+    // Compute where we would start writing (may wrap to next file if it doesn't fit).
+    logstream_pointer_t write_start = stream->meta.head;
+    if (write_start.offset + entry_size > MAX_FILE_SIZE) {
+        write_start.file_index = (write_start.file_index + 1) % MAX_FILES_PER_STREAM;
+        write_start.offset = 0;
+    }
+
+    // When moving forward from write_start, the tail must not appear within the bytes we are about to write.
+    uint32_t dist_to_tail = ring_forward_distance_bytes(&write_start, &stream->meta.tail);
+    if (dist_to_tail >= entry_size) return ESP_OK;
+
+    ESP_LOGW(TAG, "Buffer full, dropping entry (head %u:%lu tail %u:%lu)", stream->meta.head.file_index,
+             stream->meta.head.offset, stream->meta.tail.file_index, stream->meta.tail.offset);
+    xSemaphoreGive(stream->meta_mutex);
+    return ESP_ERR_NO_MEM;
+}
+
 esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t* out_stream) {
     if (!logger || !logger->initialized || !stream_name || !out_stream) return ESP_ERR_INVALID_ARG;
 
@@ -277,16 +300,15 @@ esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t*
 }
 
 esp_err_t logstream_close(logstream_t* stream) {
-    if (!stream || !stream->logger) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (!stream || !stream->logger) return ESP_ERR_INVALID_ARG;
 
     // Save metadata before closing
     char meta_path[STORAGE_MAX_PATH];
     get_meta_path(stream, meta_path, sizeof(meta_path));
     esp_err_t err = save_metadata(&stream->logger->storage_handle, meta_path, &stream->meta, &stream->sync_write);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to save metadata for stream '%s'", stream->name);
+        ESP_LOGW(TAG, "Failed to save metadata for stream '%s', error=%s", stream->name, esp_err_to_name(err));
+        return err;
     }
 
     if (stream->op_sem) {
@@ -303,9 +325,8 @@ esp_err_t logstream_close(logstream_t* stream) {
 }
 
 esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len) {
-    if (!stream || !stream->logger || !payload || len == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (!stream || !stream->logger || !payload || len == 0) return ESP_ERR_INVALID_ARG;
+
     // Account for null terminator stored with every payload
     size_t max_payload = (STORAGE_MAX_WRITE_SIZE - ENTRY_HEADER_SIZE);
     if ((len + 1) > max_payload) {
@@ -321,23 +342,10 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
 
     // Check if buffer is full.
     // Full means: writing this entry would overwrite unread data (tail) in the circular address space.
-    if (stream->meta.num_unread_entries != 0) {
-        // Compute where we would start writing (may wrap to next file if it doesn't fit).
-        logstream_pointer_t write_start = stream->meta.head;
-        if (write_start.offset + total_entry_size > MAX_FILE_SIZE) {
-            write_start.file_index = (write_start.file_index + 1) % MAX_FILES_PER_STREAM;
-            write_start.offset = 0;
-        }
-
-        // Proper ring-buffer full detection (option B): when moving forward from write_start,
-        // the tail must not appear within the bytes we are about to write.
-        uint32_t dist_to_tail = ring_forward_distance_bytes(&write_start, &stream->meta.tail);
-        if (dist_to_tail < total_entry_size) {
-            ESP_LOGW(TAG, "Buffer full, dropping entry (head %u:%lu tail %u:%lu)", stream->meta.head.file_index,
-                     stream->meta.head.offset, stream->meta.tail.file_index, stream->meta.tail.offset);
-            xSemaphoreGive(stream->meta_mutex);
-            return ESP_ERR_NO_MEM;
-        }
+    esp_err_t err = check_buffer_capacity(stream, total_entry_size);
+    if (err != ESP_OK) {
+        xSemaphoreGive(stream->meta_mutex);
+        return err;
     }
 
     // Prepare entry with header
@@ -361,7 +369,6 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     char file_path[STORAGE_MAX_PATH];
     get_file_path(stream, stream->meta.head.file_index, file_path, sizeof(file_path));
 
-    esp_err_t err;
     if (stream->meta.head.offset == 0) {
         // Write new file
         err = storage_write_sync(&stream->logger->storage_handle, file_path, entry_buffer, total_entry_size,
