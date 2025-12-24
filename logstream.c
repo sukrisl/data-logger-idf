@@ -257,9 +257,8 @@ esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t*
 
     // Prepare logstream structure
     snprintf(out_stream->name, sizeof(out_stream->name), "%s", stream_name);
-    snprintf(out_stream->dirpath, sizeof(out_stream->dirpath), "%s/%s", logger->storage_handle.mount.base_path,
-             stream_name);
-    snprintf(out_stream->metapath, sizeof(out_stream->metapath), "%s/meta", (const char*)out_stream->dirpath);
+    snprintf(out_stream->dirpath, sizeof(out_stream->dirpath), "/%s", stream_name);
+    snprintf(out_stream->metapath, sizeof(out_stream->metapath), "%s/meta.bin", (const char*)out_stream->dirpath);
     out_stream->logger = logger;
 
     // Create a single semaphore used for all sync contexts
@@ -442,7 +441,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
                                               sizeof(read_buffer), &stream->sync_read);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to read file %u: %s", current_pos.file_index, esp_err_to_name(err));
-                break;
+                return err;
             }
             current_file = current_pos.file_index;
             file_loaded = true;
@@ -472,7 +471,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
 
         // Check if entry fits in current file
         if (current_pos.offset + ENTRY_HEADER_SIZE + payload_len > MAX_FILE_SIZE) {
-            ESP_LOGW(TAG, "Entry exceeds file boundary at file %u offset %lu; moving to next file",
+            ESP_LOGW(TAG, "%s: Entry exceeds file boundary at file %u offset %lu; moving to next file", stream->name,
                      current_pos.file_index, current_pos.offset);
             current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
             current_pos.offset = 0;
@@ -490,8 +489,8 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         uint8_t* payload_ptr = read_buffer + current_pos.offset + ENTRY_HEADER_SIZE;
         uint16_t calculated_checksum = calculate_entry_checksum(payload_ptr, payload_len);
         if (calculated_checksum != header->checksum) {
-            ESP_LOGW(TAG, "Checksum mismatch at file %u offset %lu; moving to next file", current_pos.file_index,
-                     current_pos.offset);
+            ESP_LOGW(TAG, "%s: Checksum mismatch at file %u offset %lu; moving to next file", stream->name,
+                     current_pos.file_index, current_pos.offset);
             // End of valid data in this file, move to next
             current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
             current_pos.offset = 0;
