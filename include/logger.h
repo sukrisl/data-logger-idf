@@ -25,33 +25,6 @@ typedef struct {
 esp_err_t logger_init(mount_point_t* mount_point, logger_t* out);
 esp_err_t logger_deinit(logger_t* logger);
 
-// TODO: API of log streams
-esp_err_t logger_register_stream(const char* stream_name, logger_t* logger);
-esp_err_t logger_unregister_stream(const char* stream_name, logger_t* logger);
-
-esp_err_t logger_put_entry(logger_t* logger, const char* stream_name, const uint8_t* payload, size_t len);
-esp_err_t logger_get_entries(logger_t* logger, const char* stream_name, uint8_t* out, size_t out_size,
-                             size_t* bytes_read);
-esp_err_t logger_mark_entries_read(logger_t* logger, const char* stream_name, void*);
-
-#define APP_LOG(stream, format, ...)                                                                                \
-    do {                                                                                                            \
-        esp_err_t err = logger_put_entry(stream, (const uint8_t*)format, snprintf(NULL, 0, format, ##__VA_ARGS__)); \
-        if (err != ESP_OK) { /* handle error */                                                                     \
-        }                                                                                                           \
-    } while (0)
-
-#define APP_LOG_GET(stream, out, out_size, bytes_read)                         \
-    do {                                                                       \
-        esp_err_t err = logger_get_entries(stream, out, out_size, bytes_read); \
-        if (err != ESP_OK) { /* handle error */                                \
-        } else {                                                               \
-            err = logger_mark_entries_read(stream, out, out_size, bytes_read); \
-            if (err != ESP_OK) { /* handle error */                            \
-            }                                                                  \
-        }                                                                      \
-    } while (0)
-
 #ifdef __cplusplus
 }
 #endif

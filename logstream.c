@@ -3,10 +3,10 @@
 #include "esp_crc.h"
 #include "esp_log.h"
 
-#define LOGGER_TIMEOUT_MS 500
+#define LOGGER_TIMEOUT_MS 1000
 
-#define MAX_FILES_PER_STREAM 16
-#define MAX_FILE_SIZE STORAGE_MAX_WRITE_SIZE
+#define MAX_FILES_PER_STREAM 32
+#define MAX_FILE_SIZE 4096
 
 #define ENTRY_HEADER_SIZE 4
 
@@ -22,7 +22,7 @@ typedef struct __attribute__((packed)) {
 
 // Helper functions
 static uint8_t calculate_meta_crc(const logstream_meta_t* meta) {
-    return esp_crc8_le(0, (uint8_t*)meta, sizeof(logstream_meta_t) - sizeof(uint32_t));
+    return esp_crc8_le(0, (const uint8_t*)meta, sizeof(*meta) - sizeof(meta->crc8));
 }
 
 static uint16_t calculate_entry_checksum(const uint8_t* data, size_t len) {
@@ -54,6 +54,16 @@ static void get_file_path(const logstream_t* stream, uint16_t file_index, char* 
 }
 
 // Synchronous wrappers around storage_worker operations
+static inline void sync_prepare(op_sync_t* sync) {
+    if (!sync || !sync->sem) return;
+    while (xSemaphoreTake(sync->sem, 0) == pdTRUE) {
+    }
+    sync->completed = false;
+    sync->status = ESP_OK;
+    sync->bytes_processed = 0;
+    sync->read_len = 0;
+}
+
 static inline esp_err_t wait_for_sync(op_sync_t* sync, uint32_t timeout_ms) {
     if (!sync || !sync->sem) return ESP_ERR_INVALID_ARG;
     TickType_t ticks = (timeout_ms == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
@@ -63,79 +73,55 @@ static inline esp_err_t wait_for_sync(op_sync_t* sync, uint32_t timeout_ms) {
     return sync->status;
 }
 
+static inline esp_err_t wait_for_sync_or_log_timeout(op_sync_t* sync, const char* op_name, const char* path) {
+    esp_err_t err = wait_for_sync(sync, LOGGER_TIMEOUT_MS);
+    if (err == ESP_ERR_TIMEOUT) {
+        ESP_LOGE(TAG, "%s timeout on '%s'", op_name ? op_name : "storage_op", path ? path : "(null)");
+    }
+    return err;
+}
+
 static esp_err_t storage_write_sync(storage_worker_t* worker, const char* path, const void* data, size_t len,
                                     op_sync_t* sync) {
     if (!worker || !path || !data || !sync || !sync->sem) return ESP_ERR_INVALID_ARG;
-    // clear any previous signal
-    while (xSemaphoreTake(sync->sem, 0) == pdTRUE) {
-    }
-    sync->completed = false;
+    sync_prepare(sync);
     esp_err_t err = storage_write(worker, path, data, len, (void*)sync);
     if (err != ESP_OK) return err;
-    // wait for completion
-    err = wait_for_sync(sync, LOGGER_TIMEOUT_MS);
-    if (err == ESP_ERR_TIMEOUT) {
-        ESP_LOGE(TAG, "storage_write_sync timeout on '%s'", path);
-    }
-    return err;
+    return wait_for_sync_or_log_timeout(sync, "storage_write", path);
 }
 
 static esp_err_t storage_append_sync(storage_worker_t* worker, const char* path, const void* data, size_t len,
                                      op_sync_t* sync) {
     if (!worker || !path || !data || !sync || !sync->sem) return ESP_ERR_INVALID_ARG;
-    while (xSemaphoreTake(sync->sem, 0) == pdTRUE) {
-    }
-    sync->completed = false;
+    sync_prepare(sync);
     esp_err_t err = storage_append(worker, path, data, len, (void*)sync);
     if (err != ESP_OK) return err;
-    err = wait_for_sync(sync, LOGGER_TIMEOUT_MS);
-    if (err == ESP_ERR_TIMEOUT) {
-        ESP_LOGE(TAG, "storage_append_sync timeout on '%s'", path);
-    }
-    return err;
+    return wait_for_sync_or_log_timeout(sync, "storage_append", path);
 }
 
 static esp_err_t storage_read_sync(storage_worker_t* worker, const char* path, void* buf, size_t buf_size,
                                    op_sync_t* sync) {
     if (!worker || !path || !buf || !sync || !sync->sem) return ESP_ERR_INVALID_ARG;
-    while (xSemaphoreTake(sync->sem, 0) == pdTRUE) {
-    }
-    sync->completed = false;
+    sync_prepare(sync);
     esp_err_t err = storage_read(worker, path, buf, buf_size, (void*)sync);
     if (err != ESP_OK) return err;
-    err = wait_for_sync(sync, LOGGER_TIMEOUT_MS);
-    if (err == ESP_ERR_TIMEOUT) {
-        ESP_LOGE(TAG, "storage_read_sync timeout on '%s'", path);
-    }
-    return err;
+    return wait_for_sync_or_log_timeout(sync, "storage_read", path);
 }
 
 static esp_err_t storage_delete_sync(storage_worker_t* worker, const char* path, op_sync_t* sync) {
     if (!worker || !path || !sync || !sync->sem) return ESP_ERR_INVALID_ARG;
-    while (xSemaphoreTake(sync->sem, 0) == pdTRUE) {
-    }
-    sync->completed = false;
+    sync_prepare(sync);
     esp_err_t err = storage_delete(worker, path, (void*)sync);
     if (err != ESP_OK) return err;
-    err = wait_for_sync(sync, LOGGER_TIMEOUT_MS);
-    if (err == ESP_ERR_TIMEOUT) {
-        ESP_LOGE(TAG, "storage_delete_sync timeout on '%s'", path);
-    }
-    return err;
+    return wait_for_sync_or_log_timeout(sync, "storage_delete", path);
 }
 
 static esp_err_t storage_mkdir_sync(storage_worker_t* worker, const char* path, bool recursive, op_sync_t* sync) {
     if (!worker || !path || !sync || !sync->sem) return ESP_ERR_INVALID_ARG;
-    while (xSemaphoreTake(sync->sem, 0) == pdTRUE) {
-    }
-    sync->completed = false;
+    sync_prepare(sync);
     esp_err_t err = storage_mkdir(worker, path, recursive, (void*)sync);
     if (err != ESP_OK) return err;
-    err = wait_for_sync(sync, LOGGER_TIMEOUT_MS);
-    if (err == ESP_ERR_TIMEOUT) {
-        ESP_LOGE(TAG, "storage_mkdir_sync timeout on '%s'", path);
-    }
-    return err;
+    return wait_for_sync_or_log_timeout(sync, "storage_mkdir", path);
 }
 
 // Metadata operations
@@ -243,7 +229,6 @@ static esp_err_t check_buffer_capacity(logstream_t* stream, size_t entry_size) {
 
     ESP_LOGW(TAG, "Buffer full, dropping entry (head %u:%lu tail %u:%lu)", stream->meta.head.file_index,
              stream->meta.head.offset, stream->meta.tail.file_index, stream->meta.tail.offset);
-    xSemaphoreGive(stream->meta_mutex);
     return ESP_ERR_NO_MEM;
 }
 
@@ -261,17 +246,10 @@ esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t*
     snprintf(out_stream->metapath, sizeof(out_stream->metapath), "%s/meta.bin", (const char*)out_stream->dirpath);
     out_stream->logger = logger;
 
-    // Create a single semaphore used for all sync contexts
-    out_stream->op_sem = xSemaphoreCreateBinary();
-    if (out_stream->op_sem == NULL) {
-        ESP_LOGE(TAG, "Failed to create semaphore for stream '%s'", stream_name);
-        return ESP_ERR_NO_MEM;
-    }
-    // Create mutex to protect metadata from concurrent access
-    out_stream->meta_mutex = xSemaphoreCreateMutex();
-    if (out_stream->meta_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create mutex for stream '%s'", stream_name);
-        vSemaphoreDelete(out_stream->op_sem);
+    out_stream->op_sem = xSemaphoreCreateBinaryStatic(&out_stream->op_sem_storage);
+    out_stream->meta_mutex = xSemaphoreCreateMutexStatic(&out_stream->meta_mutex_storage);
+    if (out_stream->op_sem == NULL || out_stream->meta_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create sync primitives for stream '%s'", stream_name);
         return ESP_ERR_NO_MEM;
     }
     // Bind semaphore to per-op contexts
@@ -315,16 +293,6 @@ esp_err_t logstream_close(logstream_t* stream) {
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to save metadata for stream '%s', error=%s", stream->name, esp_err_to_name(err));
         return err;
-    }
-
-    if (stream->op_sem) {
-        vSemaphoreDelete(stream->op_sem);
-        stream->op_sem = NULL;
-    }
-
-    if (stream->meta_mutex) {
-        vSemaphoreDelete(stream->meta_mutex);
-        stream->meta_mutex = NULL;
     }
 
     return ESP_OK;
@@ -417,18 +385,21 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         return ESP_ERR_INVALID_STATE;
     }
 
+    esp_err_t err = ESP_OK;
+
     // No unread entries
     if (stream->meta.num_unread_entries == 0) {
-        xSemaphoreGive(stream->meta_mutex);
-        return ESP_ERR_NOT_FOUND;
+        err = ESP_ERR_NOT_FOUND;
+        goto out_unlock;
     }
 
     logstream_pointer_t current_pos = stream->meta.tail;
     size_t out_offset = 0;
     uint32_t entries_read = 0;
-    uint8_t read_buffer[STORAGE_MAX_WRITE_SIZE];
+    uint8_t read_buffer[MAX_FILE_SIZE];
     uint16_t current_file = current_pos.file_index;
     bool file_loaded = false;
+    size_t current_file_len = 0;
 
     // Read entries until buffer full or no more unread entries
     while (entries_read < stream->meta.num_unread_entries && out_offset < out_size) {
@@ -437,18 +408,26 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
             char file_path[STORAGE_MAX_PATH];
             get_file_path(stream, current_pos.file_index, file_path, sizeof(file_path));
 
-            esp_err_t err = storage_read_sync(&stream->logger->storage_handle, file_path, read_buffer,
-                                              sizeof(read_buffer), &stream->sync_read);
+            err = storage_read_sync(&stream->logger->storage_handle, file_path, read_buffer, sizeof(read_buffer),
+                                    &stream->sync_read);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to read file %u: %s", current_pos.file_index, esp_err_to_name(err));
-                return err;
+                goto out_unlock;
             }
+            current_file_len = stream->sync_read.read_len;
             current_file = current_pos.file_index;
             file_loaded = true;
+
+            if (current_file_len == 0) {
+                current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
+                current_pos.offset = 0;
+                file_loaded = false;
+                continue;
+            }
         }
 
         // Check if we have enough space for header
-        if (current_pos.offset + ENTRY_HEADER_SIZE > MAX_FILE_SIZE) {
+        if (current_pos.offset + ENTRY_HEADER_SIZE > current_file_len) {
             // Move to next file
             current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
             current_pos.offset = 0;
@@ -470,7 +449,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         }
 
         // Check if entry fits in current file
-        if (current_pos.offset + ENTRY_HEADER_SIZE + payload_len > MAX_FILE_SIZE) {
+        if (current_pos.offset + ENTRY_HEADER_SIZE + payload_len > current_file_len) {
             ESP_LOGW(TAG, "%s: Entry exceeds file boundary at file %u offset %lu; moving to next file", stream->name,
                      current_pos.file_index, current_pos.offset);
             current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
@@ -505,7 +484,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
 
         // Advance position
         current_pos.offset += ENTRY_HEADER_SIZE + payload_len;
-        if (current_pos.offset >= MAX_FILE_SIZE) {
+        if (current_pos.offset >= current_file_len || current_pos.offset >= MAX_FILE_SIZE) {
             current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
             current_pos.offset = 0;
             file_loaded = false;
@@ -531,15 +510,17 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         }
 
         // Save metadata
-        esp_err_t err = commit_metadata(stream, meta_temp);
+        err = commit_metadata(stream, meta_temp);
         if (err != ESP_OK) {
-            xSemaphoreGive(stream->meta_mutex);
-            return err;
+            goto out_unlock;
         }
     }
 
+    err = (entries_read > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
+
+out_unlock:
     xSemaphoreGive(stream->meta_mutex);
-    return (entries_read > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
+    return err;
 }
 
 esp_err_t logstream_get_status(logstream_t* stream, logstream_meta_t* out_meta) {

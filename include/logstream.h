@@ -30,7 +30,9 @@ typedef struct {
     logger_t* logger;
     logstream_meta_t meta;
     // Synchronization primitives
-    SemaphoreHandle_t op_sem;      // created in logstream_open, deleted in close
+    StaticSemaphore_t op_sem_storage;
+    StaticSemaphore_t meta_mutex_storage;
+    SemaphoreHandle_t op_sem;
     SemaphoreHandle_t meta_mutex;  // protects concurrent access to metadata
     // Per-operation contexts (separated by op type)
     op_sync_t sync_read;
