@@ -5,9 +5,6 @@
 
 #define LOGGER_TIMEOUT_MS 1000
 
-#define MAX_FILES_PER_STREAM 32
-#define MAX_FILE_SIZE 4096
-
 #define ENTRY_HEADER_SIZE 4
 
 #define METADATA_VERSION 1
@@ -33,19 +30,20 @@ static uint16_t calculate_entry_checksum(const uint8_t* data, size_t len) {
     return sum;
 }
 
-static inline uint32_t ring_total_capacity_bytes(void) {
-    return (uint32_t)MAX_FILES_PER_STREAM * (uint32_t)MAX_FILE_SIZE;
+static inline uint32_t ring_total_capacity_bytes(const logstream_t* stream) {
+    return (uint32_t)(stream->max_num_files * stream->max_file_size);
 }
 
-static inline uint32_t ring_abs_bytes(const logstream_pointer_t* ptr) {
-    return ((uint32_t)ptr->file_index * (uint32_t)MAX_FILE_SIZE) + (uint32_t)ptr->offset;
+static inline uint32_t ring_abs_bytes(const logstream_pointer_t* ptr, const logstream_t* stream) {
+    return (uint32_t)((ptr->file_index * stream->max_file_size) + ptr->offset);
 }
 
 // Forward distance from 'from' to 'to' when moving forward in the ring.
-static inline uint32_t ring_forward_distance_bytes(const logstream_pointer_t* from, const logstream_pointer_t* to) {
-    uint32_t total = ring_total_capacity_bytes();
-    uint32_t a = ring_abs_bytes(from);
-    uint32_t b = ring_abs_bytes(to);
+static inline uint32_t ring_forward_distance_bytes(const logstream_pointer_t* from, const logstream_pointer_t* to,
+                                                   const logstream_t* stream) {
+    uint32_t total = ring_total_capacity_bytes(stream);
+    uint32_t a = ring_abs_bytes(from, stream);
+    uint32_t b = ring_abs_bytes(to, stream);
     return (b + total - a) % total;
 }
 
@@ -172,7 +170,7 @@ static esp_err_t load_metadata(logstream_t* stream) {
 
 static void reset_stream_files(logstream_t* stream) {
     // Delete all log files in the circular buffer
-    for (uint16_t i = 0; i < MAX_FILES_PER_STREAM; ++i) {
+    for (uint16_t i = 0; i < stream->max_num_files; ++i) {
         char path[STORAGE_MAX_PATH];
         get_file_path(stream, i, path, sizeof(path));
         esp_err_t err = storage_delete_sync(&stream->logger->storage_handle, path, &stream->sync_delete);
@@ -218,13 +216,13 @@ static esp_err_t check_buffer_capacity(logstream_t* stream, size_t entry_size) {
 
     // Compute where we would start writing (may wrap to next file if it doesn't fit).
     logstream_pointer_t write_start = stream->meta.head;
-    if (write_start.offset + entry_size > MAX_FILE_SIZE) {
-        write_start.file_index = (write_start.file_index + 1) % MAX_FILES_PER_STREAM;
+    if (write_start.offset + entry_size > stream->max_file_size) {
+        write_start.file_index = (write_start.file_index + 1) % stream->max_num_files;
         write_start.offset = 0;
     }
 
     // When moving forward from write_start, the tail must not appear within the bytes we are about to write.
-    uint32_t dist_to_tail = ring_forward_distance_bytes(&write_start, &stream->meta.tail);
+    uint32_t dist_to_tail = ring_forward_distance_bytes(&write_start, &stream->meta.tail, stream);
     if (dist_to_tail >= entry_size) return ESP_OK;
 
     ESP_LOGW(TAG, "Buffer full, dropping entry (head %u:%lu tail %u:%lu)", stream->meta.head.file_index,
@@ -232,7 +230,8 @@ static esp_err_t check_buffer_capacity(logstream_t* stream, size_t entry_size) {
     return ESP_ERR_NO_MEM;
 }
 
-esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t* out_stream) {
+esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t* out_stream, uint16_t max_num_files,
+                         uint16_t max_file_size) {
     if (!logger || !logger->initialized || !stream_name || !out_stream) return ESP_ERR_INVALID_ARG;
 
     if (strlen(stream_name) >= sizeof(out_stream->name)) {
@@ -245,6 +244,8 @@ esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t*
     snprintf(out_stream->dirpath, sizeof(out_stream->dirpath), "/%s", stream_name);
     snprintf(out_stream->metapath, sizeof(out_stream->metapath), "%s/meta.bin", (const char*)out_stream->dirpath);
     out_stream->logger = logger;
+    out_stream->max_num_files = max_num_files;
+    out_stream->max_file_size = max_file_size;
 
     out_stream->op_sem = xSemaphoreCreateBinaryStatic(&out_stream->op_sem_storage);
     out_stream->meta_mutex = xSemaphoreCreateMutexStatic(&out_stream->meta_mutex_storage);
@@ -338,9 +339,9 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     logstream_meta_t meta_temp = stream->meta;
 
     // Check if entry fits in current file
-    if (meta_temp.head.offset + total_entry_size > MAX_FILE_SIZE) {
+    if (meta_temp.head.offset + total_entry_size > stream->max_file_size) {
         // Move to next file
-        meta_temp.head.file_index = (meta_temp.head.file_index + 1) % MAX_FILES_PER_STREAM;
+        meta_temp.head.file_index = (meta_temp.head.file_index + 1) % stream->max_num_files;
         meta_temp.head.offset = 0;
     }
 
@@ -390,13 +391,14 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
     // No unread entries
     if (stream->meta.num_unread_entries == 0) {
         err = ESP_ERR_NOT_FOUND;
-        goto out_unlock;
+        xSemaphoreGive(stream->meta_mutex);
+        return err;
     }
 
     logstream_pointer_t current_pos = stream->meta.tail;
     size_t out_offset = 0;
     uint32_t entries_read = 0;
-    uint8_t read_buffer[MAX_FILE_SIZE];
+    uint8_t read_buffer[stream->max_file_size];
     uint16_t current_file = current_pos.file_index;
     bool file_loaded = false;
     size_t current_file_len = 0;
@@ -412,14 +414,15 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
                                     &stream->sync_read);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to read file %u: %s", current_pos.file_index, esp_err_to_name(err));
-                goto out_unlock;
+                xSemaphoreGive(stream->meta_mutex);
+                return err;
             }
             current_file_len = stream->sync_read.read_len;
             current_file = current_pos.file_index;
             file_loaded = true;
 
             if (current_file_len == 0) {
-                current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
+                current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
                 current_pos.offset = 0;
                 file_loaded = false;
                 continue;
@@ -429,7 +432,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         // Check if we have enough space for header
         if (current_pos.offset + ENTRY_HEADER_SIZE > current_file_len) {
             // Move to next file
-            current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
+            current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
             file_loaded = false;
             continue;
@@ -440,9 +443,9 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         uint16_t payload_len = header->length;
 
         // Check for EOF marker (zero length) or invalid length
-        if (payload_len == 0 || payload_len > (MAX_FILE_SIZE - ENTRY_HEADER_SIZE)) {
+        if (payload_len == 0 || payload_len > (stream->max_file_size - ENTRY_HEADER_SIZE)) {
             // End of valid data in this file, move to next
-            current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
+            current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
             file_loaded = false;
             continue;
@@ -452,7 +455,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         if (current_pos.offset + ENTRY_HEADER_SIZE + payload_len > current_file_len) {
             ESP_LOGW(TAG, "%s: Entry exceeds file boundary at file %u offset %lu; moving to next file", stream->name,
                      current_pos.file_index, current_pos.offset);
-            current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
+            current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
             file_loaded = false;
             continue;
@@ -471,7 +474,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
             ESP_LOGW(TAG, "%s: Checksum mismatch at file %u offset %lu; moving to next file", stream->name,
                      current_pos.file_index, current_pos.offset);
             // End of valid data in this file, move to next
-            current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
+            current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
             file_loaded = false;
             continue;
@@ -484,8 +487,8 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
 
         // Advance position
         current_pos.offset += ENTRY_HEADER_SIZE + payload_len;
-        if (current_pos.offset >= current_file_len || current_pos.offset >= MAX_FILE_SIZE) {
-            current_pos.file_index = (current_pos.file_index + 1) % MAX_FILES_PER_STREAM;
+        if (current_pos.offset >= current_file_len || current_pos.offset >= stream->max_file_size) {
+            current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
             file_loaded = false;
         }
@@ -512,13 +515,12 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         // Save metadata
         err = commit_metadata(stream, meta_temp);
         if (err != ESP_OK) {
-            goto out_unlock;
+            xSemaphoreGive(stream->meta_mutex);
+            return err;
         }
     }
 
     err = (entries_read > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
-
-out_unlock:
     xSemaphoreGive(stream->meta_mutex);
     return err;
 }

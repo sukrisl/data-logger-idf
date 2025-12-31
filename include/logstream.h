@@ -29,6 +29,9 @@ typedef struct {
     char metapath[STORAGE_MAX_PATH];
     logger_t* logger;
     logstream_meta_t meta;
+    // Configuration
+    uint16_t max_num_files;
+    uint16_t max_file_size;
     // Synchronization primitives
     StaticSemaphore_t op_sem_storage;
     StaticSemaphore_t meta_mutex_storage;
@@ -42,7 +45,8 @@ typedef struct {
     op_sync_t sync_mkdir;
 } logstream_t;
 
-esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t* out_stream);
+esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t* out_stream, uint16_t max_num_files,
+                         uint16_t max_file_size);
 esp_err_t logstream_close(logstream_t* stream);
 esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len);
 esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_size, size_t* bytes_read);
