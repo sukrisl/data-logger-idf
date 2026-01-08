@@ -240,7 +240,7 @@ static esp_err_t check_buffer_capacity(logstream_t* stream, size_t entry_size) {
 }
 
 esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t* out_stream, uint16_t max_num_files,
-                         uint16_t max_file_size) {
+                         uint16_t max_file_size, on_fifo_full_t on_full) {
     if (!logger || !logger->initialized || !stream_name || !out_stream) return ESP_ERR_INVALID_ARG;
 
     if (strlen(stream_name) >= sizeof(out_stream->name)) {
@@ -249,6 +249,7 @@ esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t*
     }
 
     // Prepare logstream structure
+    out_stream->on_full = on_full;
     snprintf(out_stream->name, sizeof(out_stream->name), "%s", stream_name);
     snprintf(out_stream->dirpath, sizeof(out_stream->dirpath), "/%s", stream_name);
     snprintf(out_stream->metapath, sizeof(out_stream->metapath), "%s/meta.bin", (const char*)out_stream->dirpath);
@@ -350,7 +351,7 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
 
     // Check if entry fits in current file
     if (meta_temp.head.offset + total_entry_size > stream->max_file_size) {
-        ESP_LOGW(
+        ESP_LOGD(
             TAG,
             "Log entry does not fit in current file %u at offset %lu (size %u) [offset after %lu], moving to next file",
             meta_temp.head.file_index, meta_temp.head.offset, total_entry_size,
@@ -358,9 +359,17 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
         // Move to next file
         meta_temp.head.file_index = (meta_temp.head.file_index + 1) % stream->max_num_files;
 
-        if (meta_temp.head.file_index != meta_temp.tail.file_index) {
+        bool head_will_overtake_tail = (meta_temp.head.file_index == meta_temp.tail.file_index);
+        if (!head_will_overtake_tail || stream->on_full == ON_FIFO_FULL_DROP_OLD) {
             char file_path[STORAGE_MAX_PATH];
             get_file_path(stream, meta_temp.head.file_index, file_path, sizeof(file_path));
+
+            if (stream->on_full == ON_FIFO_FULL_DROP_OLD && head_will_overtake_tail) {
+                meta_temp.tail.file_index = meta_temp.head.file_index;
+                meta_temp.tail.offset = 0;
+                // TODO: Consume the entries on the deleted file instead of resetting unread count.
+                meta_temp.num_unread_entries = 0;
+            }
 
             char erase_buffer[stream->max_file_size];
             memset(erase_buffer, 0xFF, sizeof(erase_buffer));
@@ -380,7 +389,7 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     get_file_path(stream, meta_temp.head.file_index, file_path, sizeof(file_path));
 
     // Write new file if offset is zero, else append
-    ESP_LOGW(TAG, "Writing log entry to %s at offset %lu", file_path, meta_temp.head.offset);
+    ESP_LOGD(TAG, "Writing log entry to %s at offset %lu", file_path, meta_temp.head.offset);
     if (meta_temp.head.offset == 0) {
         err = storage_write_sync(&stream->logger->storage_handle, file_path, entry_buffer, total_entry_size,
                                  &stream->sync_write);
@@ -437,7 +446,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
 
         // Read header at current_pos.offset
         log_entry_header_t header;
-        ESP_LOGW(TAG, "Reading log entry header from %s at offset %lu", file_path, current_pos.offset);
+        ESP_LOGD(TAG, "Reading log entry header from %s at offset %lu", file_path, current_pos.offset);
         err = storage_read_at_sync(&stream->logger->storage_handle, file_path, current_pos.offset, &header,
                                    sizeof(header), &stream->sync_read_at);
         if (err != ESP_OK) {
@@ -449,7 +458,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
 
         if (stream->sync_read_at.bytes_processed == 0) {
             // Empty file or EOF at this offset; move to next file
-            ESP_LOGW(TAG, "%s: Reached EOF at %s offset %lu; moving to next file", stream->name, file_path,
+            ESP_LOGD(TAG, "%s: Reached EOF at %s offset %lu; moving to next file", stream->name, file_path,
                      current_pos.offset);
             current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
@@ -457,7 +466,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         }
 
         if (stream->sync_read_at.read_len < sizeof(header)) {
-            ESP_LOGW(TAG, "%s: Incomplete header at %s offset %lu; moving to next file", stream->name, file_path,
+            ESP_LOGD(TAG, "%s: Incomplete header at %s offset %lu; moving to next file", stream->name, file_path,
                      current_pos.offset);
             current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
@@ -469,7 +478,7 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         // Check for EOF marker (zero length) or invalid length
         if (payload_len == 0 || payload_len >= (stream->max_file_size - ENTRY_HEADER_SIZE)) {
             // End of valid data in this file, move to next
-            ESP_LOGW(TAG, "%s: Invalid or zero-length entry at file %u offset %lu; moving to next file", stream->name,
+            ESP_LOGD(TAG, "%s: Invalid or zero-length entry at file %u offset %lu; moving to next file", stream->name,
                      current_pos.file_index, current_pos.offset);
             current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
