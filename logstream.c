@@ -106,6 +106,15 @@ static esp_err_t storage_read_sync(storage_worker_t* worker, const char* path, v
     return wait_for_sync_or_log_timeout(sync, "storage_read", path);
 }
 
+static esp_err_t storage_read_at_sync(storage_worker_t* worker, const char* path, uint32_t offset, void* buf,
+                                      size_t buf_size, op_sync_t* sync) {
+    if (!worker || !path || !buf || !sync || !sync->sem) return ESP_ERR_INVALID_ARG;
+    sync_prepare(sync);
+    esp_err_t err = storage_read_at(worker, path, offset, buf, buf_size, (void*)sync);
+    if (err != ESP_OK) return err;
+    return wait_for_sync_or_log_timeout(sync, "storage_read_at", path);
+}
+
 static esp_err_t storage_delete_sync(storage_worker_t* worker, const char* path, op_sync_t* sync) {
     if (!worker || !path || !sync || !sync->sem) return ESP_ERR_INVALID_ARG;
     sync_prepare(sync);
@@ -160,10 +169,10 @@ static esp_err_t load_metadata(logstream_t* stream) {
         return ESP_ERR_INVALID_CRC;
     }
 
-    // Invariant: empty stream implies tail == head.
-    if (meta->num_unread_entries == 0) {
-        meta->tail = meta->head;
-    }
+    // // Invariant: empty stream implies tail == head.
+    // if (meta->num_unread_entries == 0) {
+    //     meta->tail = meta->head;
+    // }
 
     return ESP_OK;
 }
@@ -255,6 +264,7 @@ esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t*
     }
     // Bind semaphore to per-op contexts
     out_stream->sync_read.sem = out_stream->op_sem;
+    out_stream->sync_read_at.sem = out_stream->op_sem;
     out_stream->sync_write.sem = out_stream->op_sem;
     out_stream->sync_append.sem = out_stream->op_sem;
     out_stream->sync_delete.sem = out_stream->op_sem;
@@ -304,13 +314,13 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
 
     // Account for null terminator stored with every payload
     size_t max_payload = (STORAGE_MAX_WRITE_SIZE - ENTRY_HEADER_SIZE);
-    if ((len + 1) > max_payload) {
+    if (len > max_payload) {
         ESP_LOGE(TAG, "Payload too large: %u bytes (+1 for terminator, max: %d)", (unsigned)len, (int)max_payload);
         return ESP_ERR_INVALID_SIZE;
     }
 
     // Calculate total entry size (header + payload with terminator)
-    size_t total_entry_size = ENTRY_HEADER_SIZE + (len + 1);
+    size_t total_entry_size = ENTRY_HEADER_SIZE + len;
 
     // Protect metadata access from concurrent producers
     if (xSemaphoreTake(stream->meta_mutex, pdMS_TO_TICKS(LOGGER_TIMEOUT_MS)) != pdTRUE) {
@@ -327,22 +337,42 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     }
 
     // Prepare entry with header
-    uint8_t entry_buffer[STORAGE_MAX_WRITE_SIZE];
+    uint8_t entry_buffer[total_entry_size];
     log_entry_header_t* header = (log_entry_header_t*)entry_buffer;
     // Write payload and null terminator
     memcpy(entry_buffer + ENTRY_HEADER_SIZE, payload, len);
-    entry_buffer[ENTRY_HEADER_SIZE + len] = '\0';
+    entry_buffer[total_entry_size - 1] = '\0';
 
-    header->length = (uint16_t)(len + 1);  // include terminator
+    header->length = (uint16_t)len;
     header->checksum = calculate_entry_checksum(entry_buffer + ENTRY_HEADER_SIZE, header->length);
 
     logstream_meta_t meta_temp = stream->meta;
 
     // Check if entry fits in current file
     if (meta_temp.head.offset + total_entry_size > stream->max_file_size) {
+        ESP_LOGW(
+            TAG,
+            "Log entry does not fit in current file %u at offset %lu (size %u) [offset after %lu], moving to next file",
+            meta_temp.head.file_index, meta_temp.head.offset, total_entry_size,
+            meta_temp.head.offset + total_entry_size);
         // Move to next file
         meta_temp.head.file_index = (meta_temp.head.file_index + 1) % stream->max_num_files;
-        meta_temp.head.offset = 0;
+
+        if (meta_temp.head.file_index != meta_temp.tail.file_index) {
+            char file_path[STORAGE_MAX_PATH];
+            get_file_path(stream, meta_temp.head.file_index, file_path, sizeof(file_path));
+
+            char erase_buffer[stream->max_file_size];
+            memset(erase_buffer, 0xFF, sizeof(erase_buffer));
+            // Pre-erase next file
+            err = storage_write_sync(&stream->logger->storage_handle, file_path, erase_buffer, sizeof(erase_buffer),
+                                     &stream->sync_write);
+            meta_temp.head.offset = 0;
+        } else {
+            ESP_LOGW(TAG, "Buffer full when trying to advance to next file, dropping entry");
+            xSemaphoreGive(stream->meta_mutex);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     // Write entry to current file
@@ -350,6 +380,7 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     get_file_path(stream, meta_temp.head.file_index, file_path, sizeof(file_path));
 
     // Write new file if offset is zero, else append
+    ESP_LOGW(TAG, "Writing log entry to %s at offset %lu", file_path, meta_temp.head.offset);
     if (meta_temp.head.offset == 0) {
         err = storage_write_sync(&stream->logger->storage_handle, file_path, entry_buffer, total_entry_size,
                                  &stream->sync_write);
@@ -398,66 +429,50 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
     logstream_pointer_t current_pos = stream->meta.tail;
     size_t out_offset = 0;
     uint32_t entries_read = 0;
-    uint8_t read_buffer[stream->max_file_size];
-    uint16_t current_file = current_pos.file_index;
-    bool file_loaded = false;
-    size_t current_file_len = 0;
+    char file_path[STORAGE_MAX_PATH];
 
     // Read entries until buffer full or no more unread entries
     while (entries_read < stream->meta.num_unread_entries && out_offset < out_size) {
-        // Load new file if needed
-        if (!file_loaded || current_file != current_pos.file_index) {
-            char file_path[STORAGE_MAX_PATH];
-            get_file_path(stream, current_pos.file_index, file_path, sizeof(file_path));
+        get_file_path(stream, current_pos.file_index, file_path, sizeof(file_path));
 
-            err = storage_read_sync(&stream->logger->storage_handle, file_path, read_buffer, sizeof(read_buffer),
-                                    &stream->sync_read);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to read file %u: %s", current_pos.file_index, esp_err_to_name(err));
-                xSemaphoreGive(stream->meta_mutex);
-                return err;
-            }
-            current_file_len = stream->sync_read.read_len;
-            current_file = current_pos.file_index;
-            file_loaded = true;
-
-            if (current_file_len == 0) {
-                current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
-                current_pos.offset = 0;
-                file_loaded = false;
-                continue;
-            }
+        // Read header at current_pos.offset
+        log_entry_header_t header;
+        ESP_LOGW(TAG, "Reading log entry header from %s at offset %lu", file_path, current_pos.offset);
+        err = storage_read_at_sync(&stream->logger->storage_handle, file_path, current_pos.offset, &header,
+                                   sizeof(header), &stream->sync_read_at);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "%s: Failed to read header from %s offset %lu: %s", stream->name, file_path,
+                     current_pos.offset, esp_err_to_name(err));
+            xSemaphoreGive(stream->meta_mutex);
+            return err;
         }
 
-        // Check if we have enough space for header
-        if (current_pos.offset + ENTRY_HEADER_SIZE > current_file_len) {
-            // Move to next file
+        if (stream->sync_read_at.bytes_processed == 0) {
+            // Empty file or EOF at this offset; move to next file
+            ESP_LOGW(TAG, "%s: Reached EOF at %s offset %lu; moving to next file", stream->name, file_path,
+                     current_pos.offset);
             current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
-            file_loaded = false;
             continue;
         }
 
-        // Parse header
-        log_entry_header_t* header = (log_entry_header_t*)(read_buffer + current_pos.offset);
-        uint16_t payload_len = header->length;
+        if (stream->sync_read_at.read_len < sizeof(header)) {
+            ESP_LOGW(TAG, "%s: Incomplete header at %s offset %lu; moving to next file", stream->name, file_path,
+                     current_pos.offset);
+            current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
+            current_pos.offset = 0;
+            continue;
+        }
+
+        uint16_t payload_len = header.length;
 
         // Check for EOF marker (zero length) or invalid length
-        if (payload_len == 0 || payload_len > (stream->max_file_size - ENTRY_HEADER_SIZE)) {
+        if (payload_len == 0 || payload_len >= (stream->max_file_size - ENTRY_HEADER_SIZE)) {
             // End of valid data in this file, move to next
-            current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
-            current_pos.offset = 0;
-            file_loaded = false;
-            continue;
-        }
-
-        // Check if entry fits in current file
-        if (current_pos.offset + ENTRY_HEADER_SIZE + payload_len > current_file_len) {
-            ESP_LOGW(TAG, "%s: Entry exceeds file boundary at file %u offset %lu; moving to next file", stream->name,
+            ESP_LOGW(TAG, "%s: Invalid or zero-length entry at file %u offset %lu; moving to next file", stream->name,
                      current_pos.file_index, current_pos.offset);
             current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
-            file_loaded = false;
             continue;
         }
 
@@ -467,30 +482,44 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
             break;
         }
 
-        // Verify checksum
-        uint8_t* payload_ptr = read_buffer + current_pos.offset + ENTRY_HEADER_SIZE;
-        uint16_t calculated_checksum = calculate_entry_checksum(payload_ptr, payload_len);
-        if (calculated_checksum != header->checksum) {
-            ESP_LOGW(TAG, "%s: Checksum mismatch at file %u offset %lu; moving to next file", stream->name,
+        // Read payload at current_pos.offset + header
+        err = storage_read_at_sync(&stream->logger->storage_handle, file_path, current_pos.offset + ENTRY_HEADER_SIZE,
+                                   out + out_offset, payload_len, &stream->sync_read_at);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "%s: Failed to read payload from %s offset %lu len %u: %s", stream->name, file_path,
+                     current_pos.offset + ENTRY_HEADER_SIZE, (unsigned)payload_len, esp_err_to_name(err));
+            xSemaphoreGive(stream->meta_mutex);
+            return err;
+        }
+
+        if (stream->sync_read_at.read_len < payload_len) {
+            ESP_LOGW(TAG, "%s: Entry exceeds file boundary at file %u offset %lu; moving to next file", stream->name,
                      current_pos.file_index, current_pos.offset);
-            // End of valid data in this file, move to next
             current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
-            file_loaded = false;
             continue;
         }
 
-        // Copy payload to output buffer
-        memcpy(out + out_offset, payload_ptr, payload_len);
+        // Verify checksum over the payload bytes we just read
+        uint16_t calculated_checksum = calculate_entry_checksum(out + out_offset, payload_len);
+        if (calculated_checksum != header.checksum) {
+            ESP_LOGW(TAG, "%s: Checksum mismatch at file %u offset %lu; moving to next file", stream->name,
+                     current_pos.file_index, current_pos.offset);
+            current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
+            current_pos.offset = 0;
+            continue;
+        }
+
         out_offset += payload_len;
         entries_read++;
 
         // Advance position
         current_pos.offset += ENTRY_HEADER_SIZE + payload_len;
-        if (current_pos.offset >= current_file_len || current_pos.offset >= stream->max_file_size) {
+        if (current_pos.offset >= stream->max_file_size) {
+            ESP_LOGW(TAG, "%s: Reached end of file %u offset %lu; moving to next file", stream->name,
+                     current_pos.file_index, current_pos.offset);
             current_pos.file_index = (current_pos.file_index + 1) % stream->max_num_files;
             current_pos.offset = 0;
-            file_loaded = false;
         }
 
         // Check if we've reached the head pointer (stop after advancing, not before)

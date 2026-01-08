@@ -39,6 +39,7 @@ typedef struct {
     SemaphoreHandle_t meta_mutex;  // protects concurrent access to metadata
     // Per-operation contexts (separated by op type)
     op_sync_t sync_read;
+    op_sync_t sync_read_at;
     op_sync_t sync_write;
     op_sync_t sync_append;
     op_sync_t sync_delete;
