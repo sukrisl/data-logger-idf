@@ -415,7 +415,8 @@ esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len)
     return err;
 }
 
-esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_size, size_t* bytes_read) {
+esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_size, size_t* bytes_read,
+                               log_read_receipt_t* receipt) {
     if (!stream || !stream->logger || !out || !bytes_read) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -539,26 +540,70 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
 
     *bytes_read = out_offset;
 
-    // Update metadata if we read any entries
-    logstream_meta_t meta_temp = stream->meta;
-    if (entries_read > 0) {
-        meta_temp.tail = current_pos;
-        meta_temp.num_unread_entries -= entries_read;
+    if (receipt == NULL) {
+        // Update metadata if we read any entries
+        logstream_meta_t meta_temp = stream->meta;
+        if (entries_read > 0) {
+            meta_temp.tail = current_pos;
+            meta_temp.num_unread_entries -= entries_read;
 
-        // Invariant: empty stream implies tail == head.
-        if (meta_temp.num_unread_entries == 0) {
-            meta_temp.tail = meta_temp.head;
-        }
+            // Invariant: empty stream implies tail == head.
+            if (meta_temp.num_unread_entries == 0) {
+                meta_temp.tail = meta_temp.head;
+            }
 
-        // Save metadata
-        err = commit_metadata(stream, meta_temp);
-        if (err != ESP_OK) {
-            xSemaphoreGive(stream->meta_mutex);
-            return err;
+            // Save metadata
+            err = commit_metadata(stream, meta_temp);
+            if (err != ESP_OK) {
+                xSemaphoreGive(stream->meta_mutex);
+                return err;
+            }
         }
+    } else {
+        // Fill receipt
+        log_read_receipt_t gen_receipt;
+        gen_receipt.prev_read_offset = stream->meta.tail.offset;
+        gen_receipt.last_read_offset = current_pos.offset;
+        gen_receipt.prev_read_file_index = stream->meta.tail.file_index;
+        gen_receipt.last_read_file_index = current_pos.file_index;
+        gen_receipt.num_of_read_entries = entries_read;
+        memcpy((void*)receipt, &gen_receipt, sizeof(log_read_receipt_t));
     }
 
     err = (entries_read > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
+    xSemaphoreGive(stream->meta_mutex);
+    return err;
+}
+
+esp_err_t logstream_mark_read(logstream_t* stream, log_read_receipt_t* receipt) {
+    if (!stream || !receipt) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (xSemaphoreTake(stream->meta_mutex, pdMS_TO_TICKS(LOGGER_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Another operation is in progress on stream '%s'", stream->name);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Update metadata
+    logstream_meta_t meta_temp = stream->meta;
+
+    meta_temp.tail.file_index = receipt->last_read_file_index;
+    meta_temp.tail.offset = receipt->last_read_offset;
+    if (meta_temp.num_unread_entries >= receipt->num_of_read_entries) {
+        meta_temp.num_unread_entries -= receipt->num_of_read_entries;
+    } else {
+        meta_temp.num_unread_entries = 0;
+    }
+
+    // Invariant: empty stream implies tail == head.
+    if (meta_temp.num_unread_entries == 0) {
+        meta_temp.tail = meta_temp.head;
+    }
+
+    // Save metadata
+    esp_err_t err = commit_metadata(stream, meta_temp);
+
     xSemaphoreGive(stream->meta_mutex);
     return err;
 }

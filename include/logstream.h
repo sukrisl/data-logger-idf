@@ -23,9 +23,17 @@ typedef struct {
     uint32_t crc8;
 } logstream_meta_t;
 
+typedef struct {
+    uint32_t prev_read_offset;
+    uint32_t last_read_offset;
+    uint16_t prev_read_file_index;
+    uint16_t last_read_file_index;
+    uint32_t num_of_read_entries;
+} log_read_receipt_t;
+
 typedef enum {
     ON_FIFO_FULL_DROP_OLD = 0,
-    ON_FIFO_FULL_FAIL_NEW,
+    ON_FIFO_FULL_DROP_NEW,
 } on_fifo_full_t;
 
 typedef struct {
@@ -56,7 +64,9 @@ esp_err_t logstream_open(logger_t* logger, const char* stream_name, logstream_t*
                          uint16_t max_file_size, on_fifo_full_t on_full);
 esp_err_t logstream_close(logstream_t* stream);
 esp_err_t logstream_put(logstream_t* stream, const uint8_t* payload, size_t len);
-esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_size, size_t* bytes_read);
+esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_size, size_t* bytes_read,
+                               log_read_receipt_t* receipt);
+esp_err_t logstream_mark_read(logstream_t* stream, log_read_receipt_t* receipt);
 esp_err_t logstream_get_status(logstream_t* stream, logstream_meta_t* out_meta);
 
 #ifdef __cplusplus
