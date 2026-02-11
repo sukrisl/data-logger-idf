@@ -427,22 +427,26 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t err = ESP_OK;
-
     // No unread entries
     if (stream->meta.num_unread_entries == 0) {
-        err = ESP_ERR_NOT_FOUND;
         xSemaphoreGive(stream->meta_mutex);
-        return err;
+        return ESP_ERR_NOT_FOUND;
     }
 
+    // Cache metadata values before releasing mutex
     logstream_pointer_t current_pos = stream->meta.tail;
+    logstream_pointer_t head = stream->meta.head;
+    uint32_t num_unread = stream->meta.num_unread_entries;
     size_t out_offset = 0;
     uint32_t entries_read = 0;
     char file_path[STORAGE_MAX_PATH];
+    esp_err_t err = ESP_OK;
+
+    // Release mutex before performing I/O operations to prevent watchdog timeout
+    xSemaphoreGive(stream->meta_mutex);
 
     // Read entries until buffer full or no more unread entries
-    while (entries_read < stream->meta.num_unread_entries && out_offset < out_size) {
+    while (entries_read < num_unread && out_offset < out_size) {
         get_file_path(stream, current_pos.file_index, file_path, sizeof(file_path));
 
         // Read header at current_pos.offset
@@ -453,7 +457,6 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "%s: Failed to read header from %s offset %lu: %s", stream->name, file_path,
                      current_pos.offset, esp_err_to_name(err));
-            xSemaphoreGive(stream->meta_mutex);
             return err;
         }
 
@@ -498,7 +501,6 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "%s: Failed to read payload from %s offset %lu len %u: %s", stream->name, file_path,
                      current_pos.offset + ENTRY_HEADER_SIZE, (unsigned)payload_len, esp_err_to_name(err));
-            xSemaphoreGive(stream->meta_mutex);
             return err;
         }
 
@@ -533,12 +535,18 @@ esp_err_t logstream_get_unread(logstream_t* stream, uint8_t* out, size_t out_siz
         }
 
         // Check if we've reached the head pointer (stop after advancing, not before)
-        if (current_pos.file_index == stream->meta.head.file_index && current_pos.offset >= stream->meta.head.offset) {
+        if (current_pos.file_index == head.file_index && current_pos.offset >= head.offset) {
             break;  // Reached the head, stop reading
         }
     }
 
     *bytes_read = out_offset;
+
+    // Re-acquire mutex for metadata updates
+    if (xSemaphoreTake(stream->meta_mutex, pdMS_TO_TICKS(LOGGER_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Another operation is in progress on stream '%s'", stream->name);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     if (receipt == NULL) {
         // Update metadata if we read any entries
